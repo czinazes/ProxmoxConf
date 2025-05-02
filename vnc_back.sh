@@ -12,11 +12,21 @@ source /opt/vnc-venv/bin/activate          # vncdotool
 #
 # Если хотите жёстко задать конкретный файл, вместо каталога укажите
 # полный путь к .vma(.zst) — тогда поиск не выполняется.
+                 # стандартная длительность, сек
+EXTRA_TIME="${1:-0}" 
+SHARE="//192.168.100.10/AVLogs"  # куда грузим .mp4
+OUTDIR="/root"                  # где создавать файлы
+
+if ! [[ "$EXTRA_TIME" =~ ^[0-9]+$ ]]; then
+  echo "❌ Неверный аргумент: должен быть числом"
+  exit 1
+fi
+
 declare -A VM_MAP=(
-  ["127.0.0.1:77"]="101"
-  ["127.0.0.1:78"]="102"
+  ["127.0.0.1:77"]="101|avast"
+  ["127.0.0.1:78"]="102|avira"
 #  ["127.0.0.1:79"]="103"
-  ["127.0.0.1:80"]="104"
+#  ["127.0.0.1:80"]="104"
 #  ["127.0.0.1:81"]="105"
 )
 
@@ -30,7 +40,7 @@ vnc_actions() {
     move 765 185 sleep 0.1 mousedown 1 sleep 0.1 drag 820 185 sleep 0.1 mouseup 1 sleep 0.1 \
     move 675 401 sleep 0.1 click 1 sleep 15 \
     move 804 188 sleep 0.1 click 1 sleep 0.3 click 1 \
-    move 675 401 sleep 0.1 click 1 sleep 30
+    move 675 401 sleep 0.1 click 1 sleep 5
 }
 
 shutdown_vm() {
@@ -69,14 +79,43 @@ start_vm() {
 # Главная обёртка
 vnc_shutdown_restore() {
   local server="$1"
-  IFS='|' read -r vmid storage backup_src <<<"${VM_MAP[$server]}"
+  IFS='|' read -r vmid antivirus <<<"${VM_MAP[$server]}"
 
-  vnc_actions        "$server"           || { echo "[${server}] ❌ VNC failed"; return 1; }
-  sleep 30
+  # ---------- 1. старт записи --------------------------------------
+  local stamp flv mp4 rec_pid
+  stamp=$(date +%F_%H-%M-%S)
+  flv="${OUTDIR}/${antivirus}_${stamp}.flv"
+  mp4="${OUTDIR}/${antivirus}.mp4"
+
+  echo "[${server}] ▶ REC start → ${flv}"
+  flvrec.py -o "$flv" -d "$server" &        # без -t, пишем пока не остановим
+  rec_pid=$!
+
+  # ---------- 2. VNC-действия (идут параллельно с записью) ----------
+  vnc_actions "$server" || {
+    echo "[${server}] ❌ VNC failed"
+    kill -INT "$rec_pid" 2>/dev/null
+    wait  "$rec_pid" 2>/dev/null
+  }
+
+  sleep "$EXTRA_TIME"
+ 
+  kill -INT "$rec_pid"
+  wait "$rec_pid"                           # ждём корректного завершения flvrec
+
+  echo "[${antivirus}] ▶ FFmpeg → ${mp4}"
+  ffmpeg -loglevel error -y -i "$flv" -c:v libx264 -preset veryfast "$mp4"
+  sleep 1 
+  echo "[UP] ▶ smbclient put ${mp4##*/}"
+  smbclient "$SHARE" -N -c "lcd $(dirname "$mp4"); put $(basename "$mp4")" || {
+    echo "[${antivirus}] ❌ Upload failed"
+  }
+(
   shutdown_vm        "$vmid"             || { echo "[VM $vmid] ❌ Shutdown failed"; return 1; }
   restore_latest_local  "$vmid"   || { echo "[VM $vmid] ❌ Restore failed";  return 1; }
   start_vm "$vmid"                   || { echo "[VM $vmid] start failed";    return 1; }
   echo "[VM $vmid] ✅ Restored OK"
+)>>/var/log/vm_restore.log 2>&1 & disown
 }
 
 for server in "${!VM_MAP[@]}"; do
